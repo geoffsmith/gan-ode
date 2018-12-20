@@ -1,5 +1,6 @@
 from __future__ import print_function
 import argparse
+
 import os
 import random
 import torch
@@ -234,7 +235,7 @@ class ODEBlock(nn.Module):
 
     def forward(self, x):
         self.integration_time = self.integration_time.type_as(x)
-        out = odeint(self.odefunc, x, self.integration_time, rtol=ode_tol, atol=ode_tol)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=ode_tol, atol=ode_tol, method='fixed_adams')
         return out[1]
 
     @property
