@@ -12,6 +12,8 @@ import torchvision.datasets as dset
 import torchvision.transforms as transforms
 import torchvision.utils as vutils
 
+from torchdiffeq import odeint
+
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--dataset', required=True, help='cifar10 | lsun | mnist |imagenet | folder | lfw | fake')
@@ -102,6 +104,7 @@ ngpu = int(opt.ngpu)
 nz = int(opt.nz)
 ngf = int(opt.ngf)
 ndf = int(opt.ndf)
+ode_tol = 1e-3
 
 
 # custom weights initialization called on netG and netD
@@ -190,7 +193,95 @@ class Discriminator(nn.Module):
         return output.view(-1, 1).squeeze(1)
 
 
-netD = Discriminator(ngpu).to(device)
+def conv3x3(in_planes, out_planes, stride=1):
+    return nn.Conv2d(in_planes, out_planes, kernel_size=3, stride=stride, padding=1, bias=False)
+
+
+def norm(dim):
+    return nn.GroupNorm(min(32, dim), dim)
+
+
+class ODEfunc(nn.Module):
+
+    def __init__(self, dim):
+        super(ODEfunc, self).__init__()
+        self.norm1 = norm(dim)
+        self.relu = nn.ReLU(inplace=True)
+        self.conv1 = conv3x3(dim, dim)
+        self.norm2 = norm(dim)
+        self.conv2 = conv3x3(dim, dim)
+        self.norm3 = norm(dim)
+        self.nfe = 0
+
+    def forward(self, t, x):
+        self.nfe += 1
+        out = self.norm1(x)
+        out = self.relu(out)
+        out = self.conv1(out)
+        out = self.norm2(out)
+        out = self.relu(out)
+        out = self.conv2(out)
+        out = self.norm3(out)
+        return out
+
+
+class ODEBlock(nn.Module):
+
+    def __init__(self, odefunc):
+        super(ODEBlock, self).__init__()
+        self.odefunc = odefunc
+        self.integration_time = torch.tensor([0, 1]).float()
+
+    def forward(self, x):
+        self.integration_time = self.integration_time.type_as(x)
+        out = odeint(self.odefunc, x, self.integration_time, rtol=ode_tol, atol=ode_tol)
+        return out[1]
+
+    @property
+    def nfe(self):
+        return self.odefunc.nfe
+
+    @nfe.setter
+    def nfe(self, value):
+        self.odefunc.nfe = value
+
+
+class Flatten(nn.Module):
+
+    def __init__(self):
+        super(Flatten, self).__init__()
+
+    def forward(self, x):
+        shape = torch.prod(torch.tensor(x.shape[1:])).item()
+        return x.view(-1, shape)
+
+
+class ODEDiscriminator(nn.Module):
+
+    def __init__(self):
+        super(ODEDiscriminator, self).__init__()
+        dim = 64
+        self.ode_layer = ODEBlock(ODEfunc(dim))
+        self.seq = nn.Sequential(
+            nn.Conv2d(nc, dim, 3, padding=1),
+            self.ode_layer,
+            norm(dim),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d((1, 1)),
+            Flatten(),
+            nn.Linear(dim, 1),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        return self.seq.forward(x)
+
+
+is_odenet = True
+if is_odenet:
+    netD = ODEDiscriminator().to(device)
+else:
+    netD = Discriminator(ngpu).to(device)
 netD.apply(weights_init)
 if opt.netD != '':
     netD.load_state_dict(torch.load(opt.netD))
@@ -228,10 +319,21 @@ for epoch in range(opt.niter):
         label.fill_(fake_label)
         output = netD(fake.detach())
         errD_fake = criterion(output, label)
+
+        # TODO: This is for monitoring
+        # if is_odenet:
+        #     nfe_forward = netD.ode_layer.nfe
+        #     netD.ode_layer.nfe = 0
+
         errD_fake.backward()
         D_G_z1 = output.mean().item()
         errD = errD_real + errD_fake
         optimizerD.step()
+
+        # TODO: This is for monitoring
+        # if is_odenet:
+        #     nfe_backward = netD.ode_layer.nfe
+        #     netD.ode_layer.nfe = 0
 
         ############################
         # (2) Update G network: maximize log(D(G(z)))
